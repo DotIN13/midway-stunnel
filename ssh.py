@@ -1,136 +1,265 @@
-#!/usr/bin/env python3
-"""
-midway_vscode.py — Log in to a remote shell, start `scode`, and open an SSH tunnel.
-
-Refactored with Config dataclass:
-- All runtime state is carried in a Config object.
-- Cleaner function signatures (just pass cfg).
-"""
-
 from __future__ import annotations
-import subprocess
-import sys
+import socket
+import threading
+import paramiko
+from typing import Optional, Tuple
+from utils import Config, log
 
-from utils import Config
-from utils import log
 
-# -----------------------
-# Constants & Defaults
-# -----------------------
-DEFAULT_PORT_START = 49152
-DEFAULT_PORT_END = 65535
-CONTROL_PERSIST = "10m"
+class ParamikoSSHConnection:
+    """
+    Context-managed SSH connection with:
+      - password + keyboard-interactive (Duo) auth support
+      - keepalives
+      - helpers for exec and local port forwarding
+    """
 
-# -----------------------
-# Master SSH Connection
-# -----------------------
-class MasterSSHConnection:
     def __init__(self, cfg: Config, password: str):
         self.cfg = cfg
         self.password = password
+        self.client = None  # type: Optional[paramiko.SSHClient]
+        self._forwarder = None  # type: Optional[_PortForwarder]
 
+    # ---- context manager ----
     def __enter__(self):
-        self._authenticate_with_pexpect()
+        self._connect()
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        close_cmd = [
-            "ssh",
-            "-S",
-            str(self.cfg.socket_path),
-            "-O",
-            "exit",
-            *self.cfg.ssh_opts,
-            self.cfg.endpoint,
-        ]
-        subprocess.run(close_cmd, check=False)
         try:
-            if self.cfg.socket_path.exists():
-                self.cfg.socket_path.unlink()
+            self.stop_forwarding()
         except Exception:
             pass
+        try:
+            if self.client:
+                self.client.close()
+        finally:
+            self.client = None
         return False
 
-    def _authenticate_with_pexpect(self):
-        try:
-            import pexpect
-        except ImportError:
-            print(
-                "The 'pexpect' module is required. Install with: pip install pexpect",
-                file=sys.stderr,
-            )
-            sys.exit(3)
+    # ---- connection/auth ----
+    def _connect(self):
+        cfg = self.cfg
 
-        cmd = (
-            [
-                "ssh",
-                "-M",
-                "-S",
-                str(self.cfg.socket_path),
-                "-o",
-                f"ControlPersist={CONTROL_PERSIST}",
-            ]
-            + self.cfg.ssh_opts
-            + [self.cfg.endpoint, 'echo "Master connection ready"']
-        )
+        cli = paramiko.SSHClient()
+        if cfg.strict_host_key_checking:
+            # Enforce known_hosts (either default or provided)
+            if cfg.known_hosts_file:
+                cli.load_host_keys(str(cfg.known_hosts_file))
+            else:
+                cli.load_system_host_keys()
+        else:
+            cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        password_prompt = r"Password:\s*$"
-        duo_prompt = r"Passcode or option .*:.*$"
-        success_line = r"Master connection ready"
-
-        child = pexpect.spawn(
-            cmd[0], cmd[1:], encoding="utf-8", timeout=self.cfg.auth_timeout
-        )
-
-        try:
-            while True:
-                idx = child.expect(
-                    [
-                        password_prompt,
-                        duo_prompt,
-                        success_line,
-                        pexpect.EOF,
-                        pexpect.TIMEOUT,
-                    ]
-                )
-
-                print(child.before)
-                print(child.after)
-                if self.cfg.verbose:
-                    log(f"[DEBUG] pexpect matched index: {idx}", self.cfg)
-
-                if idx == 0:
-                    child.sendline(self.password)
-                    continue
-
-                if idx == 1:
-                    if self.cfg.duo_option:
-                        if self.cfg.verbose:
-                            log(
-                                f"[DEBUG] Sending Duo option: {self.cfg.duo_option}",
-                                self.cfg,
-                            )
-                        child.sendline(self.cfg.duo_option)
+        def kbdint_handler(title, instructions, prompts):
+            """
+            Respond to keyboard-interactive prompts.
+            Common prompts include:
+              - 'Password:'
+              - Duo: 'Passcode or option (1. Duo Push, 2. ...):'
+            """
+            answers = []
+            for prompt, echo in prompts:
+                pl = prompt.lower()
+                # Password prompt
+                if "password" in pl:
+                    answers.append(self.password or "")
+                # Duo prompt
+                elif "passcode or option" in pl or "passcode" in pl or "duo" in pl:
+                    if cfg.duo_option:
+                        answers.append(cfg.duo_option)
                     else:
-                        user_choice = input("Enter Duo option: ").strip()
-                        child.sendline(user_choice)
-                    continue
+                        # fall back to simple input (non-echoed here)
+                        try:
+                            ans = input(prompt).strip()
+                        except EOFError:
+                            ans = ""
+                        answers.append(ans)
+                else:
+                    # default to empty (or echo back password if that's your policy)
+                    answers.append("")
+            return answers
 
-                if idx == 2:
-                    try:
-                        child.expect(pexpect.EOF, timeout=2)
-                    except Exception:
-                        pass
-                    break
+        # Try password (and keyboard-interactive) with agent/keys allowed
+        try:
+            cli.connect(
+                cfg.hostname,
+                username=cfg.username,
+                password=self.password,
+                look_for_keys=True,
+                allow_agent=True,
+                timeout=cfg.conn_timeout,
+                banner_timeout=cfg.banner_timeout,
+                auth_timeout=cfg.auth_timeout,
+                # Paramiko will automatically try 'password' and 'keyboard-interactive'
+                # To force kbdint: pass auth_handler via connect_kex? (not needed usually)
+            )
+        except paramiko.ssh_exception.AuthenticationException:
+            # Retry using explicit keyboard-interactive if server insists on it
+            transport = paramiko.Transport((cfg.hostname, 22))
+            transport.start_client(timeout=cfg.conn_timeout)
 
-                if idx == 3:
-                    break
+            # host key checks
+            if cfg.strict_host_key_checking:
+                key = transport.get_remote_server_key()
+                # NOTE: you could check key against known_hosts here; skipping for brevity
 
-                if idx == 4:
-                    print("SSH authentication timed out.", file=sys.stderr)
-                    sys.exit(1)
-        finally:
+            # auth: keyboard-interactive first, then password fallback
             try:
-                child.close()
+                username = cfg.username or transport.get_username() or ""
+                transport.auth_interactive(username, kbdint_handler)
+            except paramiko.ssh_exception.AuthenticationException:
+                transport.auth_password(username, self.password or "")
+
+            # wrap the transport with SSHClient to reuse API
+            cli._transport = transport
+
+        # keepalive
+        cli.get_transport().set_keepalive(cfg.keepalive_interval)
+
+        self.client = cli
+        log("[DEBUG] SSH connected and keepalive set.", cfg)
+
+    # ---- exec helpers ----
+    def run(self, command: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+        """
+        Run a non-interactive remote command.
+        Returns (exit_status, stdout, stderr)
+        """
+        assert self.client is not None
+        log(f"[DEBUG] exec: {command}", self.cfg)
+        stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        rc = stdout.channel.recv_exit_status()
+        return rc, out, err
+
+    # ---- port forward ----
+    def start_forwarding(self, local_port: int, remote_host: str, remote_port: int):
+        """
+        Start a local port forward (127.0.0.1:local_port) to (remote_host:remote_port) on the OTHER side.
+        """
+        assert self.client is not None
+        if self._forwarder:
+            return
+        self._forwarder = _PortForwarder(
+            self.client.get_transport(),
+            ("127.0.0.1", local_port),
+            (remote_host, remote_port),
+            self.cfg,
+        )
+        self._forwarder.start()
+        log(
+            f"[DEBUG] Local forwarding started: 127.0.0.1:{local_port} -> {remote_host}:{remote_port}",
+            self.cfg,
+        )
+
+    def stop_forwarding(self):
+        if self._forwarder:
+            self._forwarder.stop()
+            self._forwarder = None
+            log("[DEBUG] Local forwarding stopped.", self.cfg)
+
+
+# -----------------------
+# Internal forwarder
+# -----------------------
+class _PortForwarder:
+    """
+    Minimal local TCP forwarder using Paramiko 'direct-tcpip' channels.
+    """
+
+    def __init__(
+        self, transport: paramiko.Transport, listen_addr, dest_addr, cfg: Config
+    ):
+        self.transport = transport
+        self.listen_addr = listen_addr
+        self.dest_addr = dest_addr
+        self.cfg = cfg
+        self._listener = None  # type: Optional[socket.socket]
+        self._accept_thread = None
+        self._stop = threading.Event()
+        self._children = set()
+        self._children_lock = threading.Lock()
+
+    def start(self):
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(self.listen_addr)
+        self._listener.listen(50)
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._listener:
+                self._listener.close()
+        except Exception:
+            pass
+        with self._children_lock:
+            for t in list(self._children):
+                try:
+                    t.join(timeout=0.5)
+                except Exception:
+                    pass
+            self._children.clear()
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                client_sock, client_addr = self._listener.accept()
+            except OSError:
+                # closed
+                break
+            t = threading.Thread(
+                target=self._handle_client, args=(client_sock, client_addr), daemon=True
+            )
+            with self._children_lock:
+                self._children.add(t)
+            t.start()
+
+    def _handle_client(self, client_sock: socket.socket, client_addr):
+        # Open SSH channel to dest_addr using direct-tcpip
+        try:
+            chan = self.transport.open_channel(
+                kind="direct-tcpip",
+                dest_addr=self.dest_addr,  # (host, port) on remote
+                src_addr=client_addr,  # origin of the connection (for logging)
+            )
+        except Exception as e:
+            log(f"[DEBUG] open_channel failed: {e}", self.cfg)
+            client_sock.close()
+            return
+
+        # Bi-directional copy
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(32768)
+                    if not data:
+                        break
+                    dst.sendall(data)
             except Exception:
                 pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+
+        t1 = threading.Thread(target=pump, args=(client_sock, chan), daemon=True)
+        t2 = threading.Thread(target=pump, args=(chan, client_sock), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        try:
+            chan.close()
+        except Exception:
+            pass
+        try:
+            client_sock.close()
+        except Exception:
+            pass

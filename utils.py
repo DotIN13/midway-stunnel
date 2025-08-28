@@ -12,32 +12,46 @@ import random
 # -----------------------
 DEFAULT_PORT_START = 49152
 DEFAULT_PORT_END = 65535
-CONTROL_PERSIST = "10m"
+
 
 # -----------------------
 # Config dataclass
 # -----------------------
 @dataclass
 class Config:
-    endpoint: str
+    endpoint: str  # user@host or HostAlias
     local_port: int
-    remote_port: int
+    remote_port: int  # 0 = random ephemeral
     password: Optional[str] = None
     password_file: Optional[Path] = None
     duo_option: Optional[str] = None
-    ssh_options: List[str] = field(default_factory=list)
+    ssh_options: List[str] = field(
+        default_factory=list
+    )  # (kept for compatibility; ignored here)
     verbose: bool = False
+
+    # Paramiko-specific knobs
     auth_timeout: int = 30
-    socket_path: Path = field(init=False)
-    ssh_opts: List[str] = field(init=False)
+    banner_timeout: int = 30
+    conn_timeout: int = 15
+    keepalive_interval: int = 30
+
+    # Host key policy
+    strict_host_key_checking: bool = False  # True = enforce known_hosts
+    known_hosts_file: Optional[Path] = None
+
+    # Derived fields
+    hostname: str = field(init=False)
+    username: Optional[str] = field(init=False)
 
     def __post_init__(self):
-        self.socket_path = Path(f"/tmp/ssh-socket-{self.endpoint}-{time.time_ns()}")
-        self.ssh_opts = ["-o", "BatchMode=no", *self.ssh_options]
+        # Split endpoint "user@host" or just "host"
+        if "@" in self.endpoint:
+            self.username, self.hostname = self.endpoint.split("@", 1)
+        else:
+            self.username, self.hostname = None, self.endpoint
 
-# -----------------------
-# Helpers
-# -----------------------
+
 def log(msg: str, cfg: Config):
     if cfg.verbose:
         print(msg)
