@@ -5,6 +5,10 @@ midway_vscode.py — Log in to a remote shell, start `scode`, and open an SSH tu
 Refactored with Config dataclass:
 - All runtime state is carried in a Config object.
 - Cleaner function signatures (just pass cfg).
+
+Updates:
+- Start `scode` in its own process group (setsid) to enable group-wide shutdown.
+- Ensure cleanup runs while the master connection is still open (reuse it on exit).
 """
 
 from __future__ import annotations
@@ -76,21 +80,45 @@ def run_remote(cfg: Config, cmd: str) -> str:
 
 
 def start_scode(cfg: Config, port: int) -> int:
-    log_path = f"~/.scode_{port}.log"
-    # Use 'echo $!' to capture the background PID
-    scode_cmd = f"nohup scode serve --local --port {port} > {log_path} 2>&1 & echo $!"
+    """
+    Start scode in its own session/process group so we can kill the whole tree.
+
+    We use setsid so the started process' PID == its PGID. We capture that PID
+    via 'echo $!' and treat it as the PGID for group-wide signaling later.
+    """
+    scode_cmd = (
+        # Use bash -lc for consistent shell behavior and PATH loading
+        f"bash -lc 'setsid scode serve --local --port {port} "
+        f">/dev/null 2>&1 & echo $!'"
+    )
     pid_str = run_remote(cfg, scode_cmd)
-    pid = int(pid_str.strip())
-    print(f"Remote scode started on port {port} (PID: {pid}, log: {log_path})")
-    return pid
+    pgid = int(pid_str.strip())
+    print(f"Remote scode started on port {port} (PGID: {pgid})")
+    return pgid  # PGID == PID of session leader
 
 
-def stop_scode(cfg: Config, pid: int):
+def stop_scode(cfg: Config, pgid: int | None):
+    """
+    Stop the entire process group started by start_scode.
+    We send TERM to the group, wait a tick, then KILL if needed.
+
+    Note: negative PID targets a process group: kill -TERM -<pgid>
+    """
+    if not pgid:
+        return
     try:
-        run_remote(cfg, f"pkill -TERM -P {pid}; kill -TERM {pid}")
-        print(f"Stopped remote scode process (PID: {pid})")
+        # Try graceful shutdown for the group
+        run_remote(cfg, f"kill -TERM -{pgid} || true")
+        # small grace period
+        time.sleep(0.5)
+        # If anything is still around, escalate
+        run_remote(cfg, f"kill -KILL -{pgid} || true")
+        print(f"Stopped remote scode process group (PGID: {pgid})")
     except subprocess.CalledProcessError:
-        print(f"Warning: failed to stop scode (PID: {pid}) — it may have already exited.")
+        print(
+            f"Warning: failed to stop scode process group (PGID: {pgid}) — "
+            "it may have already exited."
+        )
 
 
 def open_tunnel(cfg: Config, remote_port: int):
@@ -99,15 +127,18 @@ def open_tunnel(cfg: Config, remote_port: int):
         "-S",
         str(cfg.socket_path),
         "-f",
+        "-d",  # let us see errors in foreground before daemonizing
         "-N",
         "-L",
         f"{cfg.local_port}:127.0.0.1:{remote_port}",
         *cfg.ssh_opts,
         cfg.endpoint,
     ]
+    # Start the tunnel (this process backgrounds itself due to -f -N)
     subprocess.run(tunnel_cmd, check=True)
     print(
-        f"Tunnel established: http://localhost:{cfg.local_port} -> {cfg.endpoint}:127.0.0.1:{remote_port}"
+        f"Tunnel established: http://localhost:{cfg.local_port} -> "
+        f"{cfg.endpoint}:127.0.0.1:{remote_port}"
     )
 
 
@@ -117,18 +148,26 @@ def open_tunnel(cfg: Config, remote_port: int):
 def main():
     cfg = parse_args()
     pw = read_password(cfg)
-    pid = None
+    pgid = None
 
     print("Authenticating master SSH connection...")
     try:
+        # Keep cleanup INSIDE this context so we can reuse the master connection.
         with MasterSSHConnection(cfg, pw):
-            remote_port = pick_remote_port(cfg)
-            pid = start_scode(cfg, remote_port)
-            open_tunnel(cfg, remote_port)
+            try:
+                remote_port = pick_remote_port(cfg)
+                pgid = start_scode(cfg, remote_port)
+                open_tunnel(cfg, remote_port)
 
-            print("Press Ctrl+C to close the master connection and exit.")
-            while True:
-                time.sleep(1)
+                print("Press Ctrl+C to close the master connection and exit.")
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                # Normal shutdown path
+                pass
+            finally:
+                # Cleanup while control socket is still alive
+                stop_scode(cfg, pgid)
     except subprocess.CalledProcessError as e:
         print("A command failed:", e, file=sys.stderr)
         sys.exit(1)
@@ -137,11 +176,6 @@ def main():
         sys.exit(1)
     finally:
         print("\nExiting.")
-        # Attempt cleanup before exit
-        try:
-            stop_scode(cfg, pid)
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
