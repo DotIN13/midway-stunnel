@@ -1,8 +1,9 @@
 from __future__ import annotations
 import socket
 import threading
-import paramiko
 from typing import Optional, Tuple
+
+import paramiko
 from utils import Config, log
 
 
@@ -20,7 +21,7 @@ class ParamikoSSHConnection:
         self.client = None  # type: Optional[paramiko.SSHClient]
         self._forwarder = None  # type: Optional[_PortForwarder]
 
-    # ---- context manager ----
+    # Context manager
     def __enter__(self):
         self._connect()
         return self
@@ -37,7 +38,7 @@ class ParamikoSSHConnection:
             self.client = None
         return False
 
-    # ---- connection/auth ----
+    # Connection/auth
     def _connect(self):
         cfg = self.cfg
 
@@ -86,13 +87,11 @@ class ParamikoSSHConnection:
                 cfg.hostname,
                 username=cfg.username,
                 password=self.password,
-                look_for_keys=True,
-                allow_agent=True,
+                look_for_keys=False,
+                allow_agent=False,
                 timeout=cfg.conn_timeout,
                 banner_timeout=cfg.banner_timeout,
                 auth_timeout=cfg.auth_timeout,
-                # Paramiko will automatically try 'password' and 'keyboard-interactive'
-                # To force kbdint: pass auth_handler via connect_kex? (not needed usually)
             )
         except paramiko.ssh_exception.AuthenticationException:
             # Retry using explicit keyboard-interactive if server insists on it
@@ -120,7 +119,7 @@ class ParamikoSSHConnection:
         self.client = cli
         log("[DEBUG] SSH connected and keepalive set.", cfg)
 
-    # ---- exec helpers ----
+    # Exec helpers
     def run(self, command: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
         """
         Run a non-interactive remote command.
@@ -134,7 +133,18 @@ class ParamikoSSHConnection:
         rc = stdout.channel.recv_exit_status()
         return rc, out, err
 
-    # ---- port forward ----
+    def run_nonblock(self, command: str):
+        """
+        Run a remote command without waiting for it to finish.
+        Returns (stdin, stdout, stderr) so caller can manage streams if needed.
+        """
+        assert self.client is not None
+        log(f"[DEBUG] exec (nonblock): {command}", self.cfg)
+        stdin, stdout, stderr = self.client.exec_command(command, get_pty=False)
+        # Do not wait for exit status here — caller can poll if desired
+        return stdin, stdout, stderr
+
+    # Port forwarding
     def start_forwarding(self, local_port: int, remote_host: str, remote_port: int):
         """
         Start a local port forward (127.0.0.1:local_port) to (remote_host:remote_port) on the OTHER side.
@@ -223,9 +233,11 @@ class _PortForwarder:
         # Open SSH channel to dest_addr using direct-tcpip
         try:
             chan = self.transport.open_channel(
-                kind="direct-tcpip",
-                dest_addr=self.dest_addr,  # (host, port) on remote
-                src_addr=client_addr,  # origin of the connection (for logging)
+                "direct-tcpip",
+                self.dest_addr,
+                client_addr,
+                window_size=1024 * 1024,
+                max_packet_size=64 * 1024,
             )
         except Exception as e:
             log(f"[DEBUG] open_channel failed: {e}", self.cfg)
