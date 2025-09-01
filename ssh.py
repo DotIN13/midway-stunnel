@@ -21,6 +21,7 @@ DEFAULT_PORT_START = 49152
 DEFAULT_PORT_END = 65535
 CONTROL_PERSIST = "10m"
 
+
 # -----------------------
 # Master SSH Connection
 # -----------------------
@@ -74,7 +75,9 @@ class MasterSSHConnection:
             + [self.cfg.endpoint, 'echo "Master connection ready"']
         )
 
-        password_prompt = r"Password:\s*$"
+        # Prompts we may encounter
+        hostkey_prompt = r"Are you sure you want to continue connecting.*\?\s*$"
+        password_prompt = r"[Pp]assword:\s*$"
         duo_prompt = r"Passcode or option .*:.*$"
         success_line = r"Master connection ready"
 
@@ -86,47 +89,61 @@ class MasterSSHConnection:
             while True:
                 idx = child.expect(
                     [
-                        password_prompt,
-                        duo_prompt,
-                        success_line,
-                        pexpect.EOF,
-                        pexpect.TIMEOUT,
+                        hostkey_prompt,  # 0 — first-time host key acceptance
+                        password_prompt,  # 1
+                        duo_prompt,  # 2
+                        success_line,  # 3
+                        pexpect.EOF,  # 4
+                        pexpect.TIMEOUT,  # 5
                     ]
                 )
 
-                print(child.before)
-                print(child.after)
-                if self.cfg.verbose:
-                    log(f"[DEBUG] pexpect matched index: {idx}", self.cfg)
+                print(child.before, end="")
+                print(child.after, end="")
+                log(f"[DEBUG] pexpect matched index: {idx}", self.cfg)
 
                 if idx == 0:
-                    child.sendline(self.password)
+                    # Let the user explicitly type the response (typically 'yes')
+                    try:
+                        resp = input(
+                            "Type 'yes' to add host to known_hosts (or 'no' to abort): "
+                        ).strip()
+                    except EOFError:
+                        resp = "no"
+                    child.sendline(resp)
+
+                    # If they typed 'no', we’ll likely hit EOF soon; loop will handle it.
                     continue
 
                 if idx == 1:
+                    child.sendline(self.password)
+                    continue
+
+                if idx == 2:
                     if self.cfg.duo_option:
-                        if self.cfg.verbose:
-                            log(
-                                f"[DEBUG] Sending Duo option: {self.cfg.duo_option}",
-                                self.cfg,
-                            )
+                        log(
+                            f"[DEBUG] Sending Duo option: {self.cfg.duo_option}",
+                            self.cfg,
+                        )
                         child.sendline(self.cfg.duo_option)
                     else:
                         user_choice = input("Enter Duo option: ").strip()
                         child.sendline(user_choice)
                     continue
 
-                if idx == 2:
+                if idx == 3:
+                    # success line printed on the remote, connection is authenticated
                     try:
                         child.expect(pexpect.EOF, timeout=2)
                     except Exception:
                         pass
                     break
 
-                if idx == 3:
+                if idx == 4:
+                    # EOF before success; exit loop and let caller handle
                     break
 
-                if idx == 4:
+                if idx == 5:
                     print("SSH authentication timed out.", file=sys.stderr)
                     sys.exit(1)
         finally:

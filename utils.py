@@ -19,6 +19,8 @@ CONTROL_PERSIST = "10m"
 # -----------------------
 @dataclass
 class Config:
+    app: str
+    app_args: List[str]
     endpoint: str
     local_port: int
     remote_port: int
