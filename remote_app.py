@@ -3,7 +3,7 @@ import subprocess
 import sys
 import shlex
 from datetime import datetime
-from typing import Optional, List, Union, Dict, Any
+from typing import Optional, List, Dict, Any
 import threading
 import re
 import json
