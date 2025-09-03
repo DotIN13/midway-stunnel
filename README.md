@@ -1,4 +1,4 @@
-# stunnel — one-command apps on UChicago RCC Midway (with auto-tunneling)
+# STunnel: One-command remote web apps on Midway
 
 Run remote, browser-based apps (like VS Code Web) **on the Midway cluster** directly from your local terminal. `stunnel` handles:
 
@@ -18,7 +18,7 @@ It ships with two “apps”:
 
 ## Table of contents
 
-- [stunnel — one-command apps on UChicago RCC Midway (with auto-tunneling)](#stunnel--one-command-apps-on-uchicago-rcc-midway-with-auto-tunneling)
+- [STunnel: One-command remote web apps on Midway](#stunnel-one-command-remote-web-apps-on-midway)
   - [Table of contents](#table-of-contents)
   - [Why this exists](#why-this-exists)
   - [Requirements](#requirements)
