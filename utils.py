@@ -14,6 +14,7 @@ DEFAULT_PORT_START = 49152
 DEFAULT_PORT_END = 65535
 CONTROL_PERSIST = "10m"
 
+
 # -----------------------
 # Config dataclass
 # -----------------------
@@ -32,10 +33,12 @@ class Config:
     auth_timeout: int = 30
     socket_path: Path = field(init=False)
     ssh_opts: List[str] = field(init=False)
+    tail: bool = False
 
     def __post_init__(self):
         self.socket_path = Path(f"/tmp/ssh-socket-{self.endpoint}-{time.time_ns()}")
         self.ssh_opts = ["-o", "BatchMode=no", *self.ssh_options]
+
 
 # -----------------------
 # Helpers
@@ -63,3 +66,25 @@ def pick_remote_port(cfg: Config) -> int:
     port = random.randint(DEFAULT_PORT_START, DEFAULT_PORT_END)
     log(f"[DEBUG] Picked random remote port: {port}", cfg)
     return port
+
+
+def ask_yes_no(prompt: str, default: bool = True) -> bool:
+    """
+    Prompt the user for a yes/no answer. Returns True for yes, False for no.
+    default=True -> [Y/n], default=False -> [y/N].
+    Falls back to default on EOF or empty input.
+    """
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        ans = input(prompt + suffix).strip().lower()
+    except EOFError:
+        return default
+    if not ans:
+        return default
+    if ans in ("y", "yes"):
+        return True
+    if ans in ("n", "no"):
+        return False
+    # Unrecognized -> ask again recursively (but don’t loop forever)
+    print("Please answer 'y' or 'n'.")
+    return ask_yes_no(prompt, default)

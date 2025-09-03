@@ -24,6 +24,8 @@ class StartedApp:
     pgid: int
     logfile: str
     state_file: str
+    remote_ip: str
+    remote_url: str
     remote_port: int
 
 
@@ -62,9 +64,6 @@ class RemoteApp:
     def build_remote_command(self, port: int, app_args: List[str], logfile: str) -> str:
         """Return foreground command to start the app (framework backgrounds & logs)."""
         raise NotImplementedError
-
-    def wants_url_hinting(self) -> bool:
-        return True
 
     def rewrite_url(self, local_port: int, url: str) -> str:
         parsed = urlparse(url)
@@ -186,6 +185,13 @@ printf '[%s]\\n' "$(cat "$STATE_FILE")"
 
         state = self._select_state_interactive(states)
         started = self._started_from_state(state)
+
+        # Print the
+        local_url = self.rewrite_url(cfg.local_port, started.remote_url)
+        print("\n\n=== Web UI started ===")
+        print(f"Remote: {started.remote_url}")
+        print(f"Open locally: {local_url}\n")
+
         return started
 
     def _select_state_interactive(self, states: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -220,10 +226,12 @@ printf '[%s]\\n' "$(cat "$STATE_FILE")"
             pgid=int(state.get("pgid", 0) or 0),
             logfile=str(state.get("logfile", "")),
             state_file=str(state.get("state_file", "")),
+            remote_ip="127.0.0.1",
+            remote_url=str(state.get("url", "")),
             remote_port=int(state.get("port", 0) or 0),
         )
 
-    def tunnel(self, cfg: Config, remote_port: int):
+    def tunnel(self, cfg: Config, started: StartedApp):
         """
         Establish a local->remote tunnel to the selected state.
         """
@@ -235,7 +243,7 @@ printf '[%s]\\n' "$(cat "$STATE_FILE")"
             "-f",
             "-N",
             "-L",
-            f"{cfg.local_port}:127.0.0.1:{remote_port}",
+            f"{cfg.local_port}:{started.remote_ip}:{started.remote_port}",
             *cfg.ssh_opts,
             cfg.endpoint,
         ]
@@ -243,7 +251,7 @@ printf '[%s]\\n' "$(cat "$STATE_FILE")"
 
         print(
             f"Tunnel established: http://localhost:{cfg.local_port} -> "
-            f"{cfg.endpoint}:127.0.0.1:{remote_port}"
+            f"{cfg.endpoint}:{started.remote_ip}:{started.remote_port}"
         )
 
     def start_log_tail(
@@ -263,53 +271,9 @@ printf '[%s]\\n' "$(cat "$STATE_FILE")"
         ]
         self.log("[DEBUG] starting remote tail process", cfg)
 
-        if not self.wants_url_hinting():
-            proc = subprocess.Popen(tail_cmd, stdout=sys.stdout, stderr=sys.stderr)
-            print(f"Tailing remote log: {started.logfile}\n")
-            return proc, None
-
-        proc = subprocess.Popen(
-            tail_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-        printed_once = {"done": False}
-        url_re = getattr(self, "url_regex", None)
-
-        def _reader():
-            try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-
-                    if printed_once.get("done") or not url_re:
-                        continue
-
-                    if (
-                        "http://" in line
-                        or "https://" in line
-                        or "Web UI available" in line
-                    ):
-                        m = url_re.search(line)
-                        if m:
-                            s, e = m.span()
-                            remote_url = line[s:e]
-                            local_url = self.rewrite_url(local_port, remote_url)
-                            print("\n=== Web UI detected ===")
-                            print(f"Remote: {remote_url}")
-                            print(f"Open locally: {local_url}\n")
-                            printed_once["done"] = True
-            except Exception as e:
-                print(f"[log-tail] warning: {e}", file=sys.stderr)
-
-        t = threading.Thread(target=_reader, name=f"{self.name}-log-tail", daemon=True)
-        t.start()
+        proc = subprocess.Popen(tail_cmd, stdout=sys.stdout, stderr=sys.stderr)
         print(f"Tailing remote log: {started.logfile}\n")
-        return proc, t
+        return proc, None
 
     def stop(self, cfg: Config, started: StartedApp) -> None:
         pgid = started.pgid
@@ -368,6 +332,7 @@ rm -f "$STATE_FILE" 2>/dev/null || true
     ) -> None:
         if proc is None:
             return
+        # Terminate tailing process
         try:
             proc.terminate()
             try:
@@ -376,6 +341,7 @@ rm -f "$STATE_FILE" 2>/dev/null || true
                 proc.kill()
         except Exception:
             pass
+        # Terminate monitoring thread
         if thread is not None and thread.is_alive():
             try:
                 thread.join(timeout=0.5)

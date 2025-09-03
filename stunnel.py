@@ -8,8 +8,7 @@ Framework:
 - Master SSH control socket reused for all remote ops; cleanup while it's alive.
 - App runs in its own process group (setsid) for group-wide shutdown.
 - Logs go to ~/.stunnel/log/<app>-YYYYmmdd-HHMMSS.log (remote).
-- Live-tail logs locally; detect "Web UI available at http://0.0.0.0:<port>?tkn=..."
-  and print the mapped local URL: http://127.0.0.1:<LOCAL_PORT>?tkn=...
+- Optionally live-tail logs locally if --tail is provided.
 """
 
 from __future__ import annotations
@@ -22,12 +21,13 @@ from typing import Optional
 import threading
 
 from utils import Config
-from utils import read_password, pick_remote_port
+from utils import read_password, pick_remote_port, ask_yes_no
 from ssh import MasterSSHConnection
 from app_registry import AppRegistry
 from remote_app import StartedApp
 
-import apps.scode
+import apps.scode_local
+import apps.scode_slurm
 
 
 # =======================
@@ -71,6 +71,11 @@ def parse_args() -> Config:
         help="Extra SSH option(s), repeatable (e.g., --ssh-option '-J bastion')",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose debug logging")
+    p.add_argument(
+        "--tail",
+        action="store_true",
+        help="Enable live log tailing (disabled by default)",
+    )
 
     args = p.parse_args()
 
@@ -85,6 +90,7 @@ def parse_args() -> Config:
         verbose=args.verbose,
         app=args.app,
         app_args=args.app_args,
+        tail=args.tail,
     )
 
 
@@ -97,7 +103,7 @@ def main():
     cfg = parse_args()
     pw = read_password(cfg)
 
-    AppClass = AppRegistry.get(getattr(cfg, "app", "scode"))
+    AppClass = AppRegistry.get(getattr(cfg, "app", "scode-local"))
     app = AppClass()
 
     print(f"Starting app: {app.name}...")
@@ -113,11 +119,13 @@ def main():
                 remote_port = cfg.remote_port or pick_remote_port(cfg)
                 started = app.start(cfg, remote_port, getattr(cfg, "app_args", []))
 
-                app.tunnel(cfg, started.remote_port)
+                # If multiple states are returned, user selection happens inside tunnel()
+                started_app = app.tunnel(cfg, started)
 
-                tail_proc, tail_thread = app.start_log_tail(
-                    cfg, started, cfg.local_port
-                )
+                if getattr(cfg, "tail", False):
+                    tail_proc, tail_thread = app.start_log_tail(
+                        cfg, started_app, cfg.local_port
+                    )
 
                 print("Press Ctrl+C to close the master connection and exit.")
                 while True:
@@ -132,8 +140,21 @@ def main():
                 )
                 raise e
             finally:
-                app.stop_log_tail(tail_proc, tail_thread)
-                app.stop(cfg, started)
+                if getattr(cfg, "tail", False):
+                    app.stop_log_tail(tail_proc, tail_thread)
+
+                # Prompt user whether to stop the remote server
+                if started is not None:
+                    try:
+                        if ask_yes_no("Stop the remote server now?", default=True):
+                            app.stop(cfg, started)
+                        else:
+                            print("Leaving the remote server running.")
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to stop remote server: {e}",
+                            file=sys.stderr,
+                        )
     except subprocess.CalledProcessError as e:
         print("A command failed:", e, file=sys.stderr)
         sys.exit(1)

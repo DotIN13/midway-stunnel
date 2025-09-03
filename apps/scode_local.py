@@ -10,8 +10,8 @@ from app_registry import AppRegistry
 # -----------------------
 
 
-class ScodeApp(RemoteApp):
-    name = "scode"
+class ScodeLocalApp(RemoteApp):
+    name = "scode-local"
 
     def build_remote_command(self, port: int, app_args: List[str], logfile: str) -> str:
         # Keep output unbuffered if scode is Python-based; safe otherwise.
@@ -20,4 +20,4 @@ class ScodeApp(RemoteApp):
 
 
 # Register built-in app(s)
-AppRegistry.register(ScodeApp)
+AppRegistry.register(ScodeLocalApp)
