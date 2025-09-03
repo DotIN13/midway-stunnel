@@ -49,10 +49,9 @@ Midway is powerful but has moving parts: SSH options, Slurm queues, app logs, an
 
 * **Python 3.9+**
 * **OpenSSH client** on your local machine
+* Works with **Linux, macOS, WSL (Windows Subsystem for Linux)** (Windows Powershell support is coming soon)
 * An RCC **Midway** account and working SSH setup (keys or password; Duo as needed)
-* Optional: `scode` installed on Midway (`module load` or your env)
-
-  * For `scode-slurm`, Slurm access to `--account rcc-staff`
+* `scode` installed and activated on Midway (e.g., `module load scode` in your `~/.bashrc` or similar)
 
 ---
 
