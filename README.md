@@ -58,11 +58,11 @@ Midway is powerful but has moving parts: SSH options, Slurm queues, app logs, an
 ## Installation
 
 ```bash
-git clone https://github.com/dotin13/stunnel.git
-cd stunnel-midway
+git clone https://github.com/dotin13/midway-stunnel.git
+cd midway-stunnel
 # (optional) create a venv
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt  # if present; otherwise none needed
+pip install -r requirements.txt
 ```
 
 Place the repo on your PATH or run with `python3 stunnel.py`.
