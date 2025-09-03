@@ -121,10 +121,7 @@ class MasterSSHConnection:
 
                 if idx == 2:
                     if self.cfg.duo_option:
-                        log(
-                            f"[DEBUG] Sending Duo option: {self.cfg.duo_option}",
-                            self.cfg,
-                        )
+                        print(f"Sending Duo option: {self.cfg.duo_option}")
                         child.sendline(self.cfg.duo_option)
                     else:
                         user_choice = input("Enter Duo option: ").strip()

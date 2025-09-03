@@ -58,8 +58,7 @@ def parse_args() -> Config:
         default=0,
         help="Remote port to run the app on (0=random)",
     )
-    p.add_argument("--password", help="SSH password (or use --password-file / prompt)")
-    p.add_argument("--password-file", type=Path, help="Path to file with SSH password")
+    p.add_argument("--password", help="SSH password")
     p.add_argument(
         "--duo-option", type=str, default=None, help="Duo menu selection to send"
     )
@@ -84,7 +83,6 @@ def parse_args() -> Config:
         local_port=args.local_port,
         remote_port=args.remote_port,
         password=args.password,
-        password_file=args.password_file,
         duo_option=args.duo_option,
         ssh_options=args.ssh_options,
         verbose=args.verbose,

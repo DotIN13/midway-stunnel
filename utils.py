@@ -2,10 +2,14 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
+import os
 import sys
 import time
 import getpass
 import random
+
+import keyring
+from keyring.backends import fail
 
 # -----------------------
 # Constants & Defaults
@@ -26,7 +30,6 @@ class Config:
     local_port: int
     remote_port: int
     password: Optional[str] = None
-    password_file: Optional[Path] = None
     duo_option: Optional[str] = None
     ssh_options: List[str] = field(default_factory=list)
     verbose: bool = False
@@ -48,16 +51,55 @@ def log(msg: str, cfg: Config):
         print(msg)
 
 
-def read_password(cfg: Config) -> str:
-    if cfg.password:
+def read_password(cfg: "Config") -> str:
+    """
+    Resolve an SSH password in this order:
+      1) Explicit --password (cfg.password)
+      2) Secure OS keyring (service + username)
+      3) Interactive prompt via getpass (then saved to keyring)
+
+    Expected (but optional) Config attributes:
+      - password: Optional[str]
+      - endpoint: str (required for keyring service name)
+    """
+
+    # 1) Command-line/explicit password takes precedence
+    if getattr(cfg, "password", None):
         return cfg.password
-    if cfg.password_file:
+
+    # Validate endpoint (used to namespace service in keyring)
+    endpoint = getattr(cfg, "endpoint", None)
+    if not endpoint:
+        raise ValueError("No endpoint specified for password lookup.")
+
+    service = f"stunnel:{endpoint}"
+    username = os.environ.get("USER") or "root"
+
+    # 2) Check keyring if a secure backend is available
+    kr_backend = keyring.get_keyring()
+    if not isinstance(kr_backend, fail.Keyring):
         try:
-            return cfg.password_file.read_text().splitlines()[0].strip()
+            stored = keyring.get_password(service, username)
+            if stored:
+                return stored
         except Exception as e:
-            print(f"Error reading --password-file: {e}", file=sys.stderr)
-            sys.exit(2)
-    return getpass.getpass("SSH password: ")
+            print(f"Warning: Unable to access the system keyring: {e}", file=sys.stderr)
+
+    # 3) Fall back to interactive prompt
+    print("No SSH password found in system keyring.")
+    password = getpass.getpass("SSH password: ")
+
+    # Try to save it into the keyring for future use
+    if not isinstance(kr_backend, fail.Keyring):
+        try:
+            keyring.set_password(service, username, password)
+            print(
+                f"Password saved in system keyring for service={service}, user={username}."
+            )
+        except Exception as e:
+            print(f"Warning: Unable to save password to keyring: {e}", file=sys.stderr)
+
+    return password
 
 
 def pick_remote_port(cfg: Config) -> int:
